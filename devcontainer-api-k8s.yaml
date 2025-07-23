@@ -1,0 +1,202 @@
+---
+# ConfigMap for environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vscode-devcontainer-manager-config
+data:
+  KUBERNETES_NAMESPACE: "vscode-system"
+  BASE_DOMAIN: "vscode.local"
+  REGISTRY: "localhost:32000"
+---
+# Service account with appropriate permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vscode-devcontainer-manager-sa
+---
+# Role with permissions to manage VS Code Server resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vscode-devcontainer-manager-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "services", "persistentvolumeclaims", "pods", "pods/exec"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Role binding for the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vscode-devcontainer-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vscode-devcontainer-manager-role
+subjects:
+- kind: ServiceAccount
+  name: vscode-devcontainer-manager-sa
+---
+# DaemonSet for Docker-in-Docker to support devcontainer builds
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: docker-dind
+spec:
+  selector:
+    matchLabels:
+      app: docker-dind
+  template:
+    metadata:
+      labels:
+        app: docker-dind
+    spec:
+      containers:
+      - name: docker
+        image: docker:24-dind
+        securityContext:
+          privileged: true
+        env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ""
+        ports:
+        - containerPort: 2375
+          protocol: TCP
+        volumeMounts:
+        - name: docker-storage
+          mountPath: /var/lib/docker
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: docker-storage
+        emptyDir: {}
+      - name: modules
+        hostPath:
+          path: /lib/modules
+---
+# Service for Docker daemon
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-dind-service
+spec:
+  selector:
+    app: docker-dind
+  ports:
+  - port: 2375
+    targetPort: 2375
+  type: ClusterIP
+---
+# Deployment for the FastAPI application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vscode-devcontainer-manager
+  labels:
+    app: vscode-devcontainer-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vscode-devcontainer-manager
+  template:
+    metadata:
+      labels:
+        app: vscode-devcontainer-manager
+    spec:
+      serviceAccountName: vscode-devcontainer-manager-sa
+      containers:
+      - name: api
+        image: localhost:32000/vscode-devcontainer-manager:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: vscode-devcontainer-manager-config
+        env:
+        - name: DOCKER_HOST
+          value: "tcp://docker-dind-service:2375"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: devcontainer-builds
+          mountPath: /tmp/devcontainer-builds
+      volumes:
+      - name: devcontainer-builds
+        emptyDir:
+          sizeLimit: 10Gi
+---
+# Service to expose the FastAPI application
+apiVersion: v1
+kind: Service
+metadata:
+  name: vscode-devcontainer-manager-service
+spec:
+  selector:
+    app: vscode-devcontainer-manager
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+---
+# Ingress for path-based routing
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vscode-manager-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  tls:
+  - hosts:
+    - vscode.local
+    secretName: vscode-server-tls
+  rules:
+  - host: vscode.local
+    http:
+      paths:
+      - path: "/api(/|$)(.*)"
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: vscode-devcontainer-manager-service
+            port:
+              number: 80
+---
+# StorageClass for dynamic provisioning (MicroK8s uses hostpath by default)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: vscode-storage
+provisioner: microk8s.io/hostpath
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
