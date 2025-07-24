@@ -131,7 +131,8 @@ def generate_instance_id(user_id: str) -> str:
 
 def generate_access_token() -> str:
     """Generate a UUID-like access token for VS Code Server"""
-    return str(uuid.uuid4())
+    # VS Code Server doesn't accept hyphens in tokens, only alphanumeric and underscores
+    return uuid.uuid4().hex
 
 def generate_instance_path(instance_id: str) -> str:
     """Generate a path for the VS Code Server instance"""
@@ -386,14 +387,21 @@ def create_deployment(
     fi
     
     # Set up directories
-    mkdir -p /home/vscode/.vscode
+    mkdir -p /home/vscode/.vscode/cli-data /home/vscode/.vscode/user-data /home/vscode/.vscode/server-data /home/vscode/.vscode/extensions
     chown -R vscode:vscode /home/vscode /workspace /shared
     
+    # Export environment variables for vscode user
+    export TOKEN="${{TOKEN}}"
+    export CLI_DATA_DIR="${{CLI_DATA_DIR}}"
+    export USER_DATA_DIR="${{USER_DATA_DIR}}"
+    export SERVER_DATA_DIR="${{SERVER_DATA_DIR}}"
+    export EXTENSIONS_DIR="${{EXTENSIONS_DIR}}"
+    
     # Run VS Code Server as vscode user
-    exec su - vscode -c 'code serve-web --accept-server-license-terms --host 0.0.0.0 --port 8000 \
-        --connection-token "$TOKEN" --server-base-path {instance_path} \
-        --cli-data-dir "$CLI_DATA_DIR" --user-data-dir "$USER_DATA_DIR" \
-        --server-data-dir "$SERVER_DATA_DIR" --extensions-dir "$EXTENSIONS_DIR"'
+    exec su - vscode -c "code serve-web --accept-server-license-terms --host 0.0.0.0 --port 8000 \\
+        --connection-token '${{TOKEN}}' --server-base-path '{instance_path}' \\
+        --cli-data-dir '${{CLI_DATA_DIR}}' --user-data-dir '${{USER_DATA_DIR}}' \\
+        --server-data-dir '${{SERVER_DATA_DIR}}' --extensions-dir '${{EXTENSIONS_DIR}}'"
     """
     
     deployment = client.V1Deployment(
@@ -545,7 +553,11 @@ def create_ingress_for_instance(instance_id: str, path_prefix: str) -> None:
                 "nginx.ingress.kubernetes.io/proxy-buffer-size": "128k",
                 "nginx.ingress.kubernetes.io/proxy-http-version": "1.1",
                 "nginx.ingress.kubernetes.io/websocket-services": f"{instance_id}-service",
-                "nginx.ingress.kubernetes.io/use-regex": "true"
+                "nginx.ingress.kubernetes.io/upstream-vhost": BASE_DOMAIN,
+                "nginx.ingress.kubernetes.io/configuration-snippet": """
+                    more_set_headers "X-Forwarded-Host: $host";
+                    more_set_headers "X-Forwarded-Proto: $scheme";
+                """
             }
         ),
         spec=client.V1IngressSpec(
@@ -561,8 +573,8 @@ def create_ingress_for_instance(instance_id: str, path_prefix: str) -> None:
                     http=client.V1HTTPIngressRuleValue(
                         paths=[
                             client.V1HTTPIngressPath(
-                                path=f"{instance_path}(/.*)?",
-                                path_type="ImplementationSpecific",
+                                path=instance_path,
+                                path_type="Prefix",
                                 backend=client.V1IngressBackend(
                                     service=client.V1IngressServiceBackend(
                                         name=f"{instance_id}-service",
@@ -890,10 +902,19 @@ def get_build_logs(instance_id: str):
         )
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Build logs for instance {instance_id} not found"
-            )
+            # For simple instances, there are no build logs
+            status = get_instance_status(instance_id)
+            if status == "NotFound":
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Instance {instance_id} not found"
+                )
+            else:
+                return BuildStatus(
+                    instance_id=instance_id,
+                    status=status,
+                    logs="No build logs available (simple instance)"
+                )
         raise
 
 @app.get("/instances/{instance_id}", response_model=VSCodeServerResponse)
