@@ -69,9 +69,12 @@ DEFAULT_BASE_IMAGE = "ubuntu:22.04"  # Following devcontainer CLI best practices
 DEVCONTAINER_BUILD_PATH = "/tmp/devcontainer-builds"
 
 # When running in cluster, use the registry service name
+PUSH_REGISTRY = REGISTRY  # Registry URL for pushing images
+PULL_REGISTRY = REGISTRY  # Registry URL for pulling images
+
 if IN_CLUSTER:
     # For MicroK8s, the registry is accessible via the node IP and port 32000
-    # We need to get the node IP
+    # We need to get the node IP for pushing
     try:
         nodes = core_v1_api.list_node()
         if nodes.items:
@@ -81,8 +84,9 @@ if IN_CLUSTER:
                     node_ip = address.address
                     break
             if node_ip:
-                REGISTRY = f"{node_ip}:32000"
-                logger.info(f"Using registry at {REGISTRY}")
+                PUSH_REGISTRY = f"{node_ip}:32000"
+                PULL_REGISTRY = "localhost:32000"  # Pods pull from localhost
+                logger.info(f"Using push registry at {PUSH_REGISTRY}, pull registry at {PULL_REGISTRY}")
     except Exception as e:
         logger.error(f"Failed to get node IP: {e}")
 
@@ -279,13 +283,14 @@ async def build_devcontainer_image(
                 json.dump(devcontainer_config, f, indent=2)
         
         # Generate image name
-        image_name = f"{REGISTRY}/vscode-devcontainer-{instance_id}:latest"
+        push_image_name = f"{PUSH_REGISTRY}/vscode-devcontainer-{instance_id}:latest"
+        pull_image_name = f"{PULL_REGISTRY}/vscode-devcontainer-{instance_id}:latest"
         
         # Build the devcontainer image
         build_cmd = [
             "devcontainer", "build",
             "--workspace-folder", workspace_path,
-            "--image-name", image_name,
+            "--image-name", push_image_name,
             "--no-cache"
         ]
         
@@ -317,14 +322,14 @@ async def build_devcontainer_image(
         
         # For MicroK8s registry, we might need to tag and push differently
         # First, let's try to push directly
-        logger.info(f"Pushing image {image_name} to registry")
+        logger.info(f"Pushing image {push_image_name} to registry")
         
         # Try multiple push strategies
         push_success = False
         push_errors = []
         
         # Strategy 1: Direct push
-        push_cmd = ["docker", "push", image_name]
+        push_cmd = ["docker", "push", push_image_name]
         logger.info(f"Attempting direct push: {' '.join(push_cmd)}")
         push_process = await asyncio.create_subprocess_exec(
             *push_cmd,
@@ -353,10 +358,10 @@ async def build_devcontainer_image(
             logger.warning(error_msg)
             
             # Strategy 2: Try retagging if localhost doesn't work
-            if "localhost" in image_name and REGISTRY != "localhost:32000":
+            if "localhost" in push_image_name and PUSH_REGISTRY != "localhost:32000":
                 # Retag the image with the actual registry address
-                retag_name = image_name.replace("localhost:32000", REGISTRY)
-                retag_cmd = ["docker", "tag", image_name, retag_name]
+                retag_name = push_image_name.replace("localhost:32000", PUSH_REGISTRY)
+                retag_cmd = ["docker", "tag", push_image_name, retag_name]
                 logger.info(f"Retagging image: {' '.join(retag_cmd)}")
                 
                 retag_process = await asyncio.create_subprocess_exec(
@@ -383,7 +388,7 @@ async def build_devcontainer_image(
                     
                     if push_process.returncode == 0:
                         push_success = True
-                        image_name = retag_name
+                        push_image_name = retag_name
                         logger.info(f"Successfully pushed retagged image: {retag_name}")
                     else:
                         error_msg = f"Retagged push failed with return code {push_process.returncode}"
@@ -397,7 +402,7 @@ async def build_devcontainer_image(
             # Instead of failing, we'll use the local image
             logger.warning("Will attempt to use the locally built image")
             # Add a note to the build logs
-            build_logs.append(f"WARNING: Failed to push to registry, using local image: {image_name}")
+            build_logs.append(f"WARNING: Failed to push to registry, using local image: {push_image_name}")
         
         # Store build logs
         logs_cm = client.V1ConfigMap(
@@ -419,7 +424,8 @@ async def build_devcontainer_image(
         except client.exceptions.ApiException:
             pass  # Ignore if already exists
         
-        return image_name
+        # Return the pull image name for deployment
+        return pull_image_name
         
     finally:
         # Cleanup build directory
@@ -1179,7 +1185,7 @@ async def create_devcontainer_instance(
         access_token=access_token,
         status="Queued",
         base_image=DEFAULT_BASE_IMAGE,
-        devcontainer_image=f"{REGISTRY}/vscode-devcontainer-{instance_id}:latest",
+        devcontainer_image=f"{PULL_REGISTRY}/vscode-devcontainer-{instance_id}:latest",
         build_logs_url=build_logs_url
     )
 
@@ -1258,7 +1264,7 @@ async def create_workspace_instance(
         access_token=access_token,
         status="Queued",
         base_image=DEFAULT_BASE_IMAGE,
-        devcontainer_image=f"{REGISTRY}/vscode-devcontainer-{instance_id}:latest",
+        devcontainer_image=f"{PULL_REGISTRY}/vscode-devcontainer-{instance_id}:latest",
         build_logs_url=build_logs_url
     )
 
