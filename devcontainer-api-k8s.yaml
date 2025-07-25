@@ -49,6 +49,7 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: docker-dind
+  namespace: vscode-system
 spec:
   selector:
     matchLabels:
@@ -66,6 +67,20 @@ spec:
         env:
         - name: DOCKER_TLS_CERTDIR
           value: ""
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        command:
+        - sh
+        - -c
+        - |
+          dockerd \
+          --host=tcp://0.0.0.0:2375 \
+          --insecure-registry=${NODE_IP}:32000 \
+          --insecure-registry=localhost:32000 \
+          --insecure-registry=10.0.0.0/8 \
+          --insecure-registry=192.168.0.0/16
         ports:
         - containerPort: 2375
           protocol: TCP
@@ -165,7 +180,7 @@ spec:
     targetPort: 8080
   type: ClusterIP
 ---
-# Ingress for path-based routing
+# Ingress for path-based routing with increased timeouts
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -175,6 +190,10 @@ metadata:
     nginx.ingress.kubernetes.io/rewrite-target: "/$2"
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    # Increased timeouts for devcontainer builds
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
 spec:
   tls:
   - hosts:

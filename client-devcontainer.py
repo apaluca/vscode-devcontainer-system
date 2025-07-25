@@ -12,6 +12,7 @@ import sys
 import requests
 import tarfile
 import tempfile
+import time
 from typing import Dict, Any, Optional
 import urllib3
 
@@ -80,12 +81,17 @@ def parse_args():
     logs_parser = subparsers.add_parser("build-logs", help="Get build logs for an instance")
     logs_parser.add_argument("--instance-id", required=True, help="Instance ID")
     
+    # Get build status command
+    status_parser = subparsers.add_parser("build-status", help="Get build status for an instance")
+    status_parser.add_argument("--instance-id", required=True, help="Instance ID")
+    
     # Delete instance command
     delete_parser = subparsers.add_parser("delete", help="Delete a VS Code Server instance")
     delete_parser.add_argument("--instance-id", required=True, help="Instance ID")
     
     # Global options
     parser.add_argument("--api-url", default=DEFAULT_API_URL, help=f"API URL (default: {DEFAULT_API_URL})")
+    parser.add_argument("--no-wait", action="store_true", help="Don't wait for build to complete")
     
     return parser.parse_args()
 
@@ -117,6 +123,46 @@ def make_api_request(method: str, url: str, data: Optional[Dict[str, Any]] = Non
             except ValueError:
                 print(f"API Error: {e.response.text}")
         sys.exit(1)
+
+def wait_for_build(api_url: str, instance_id: str, max_wait: int = 300) -> bool:
+    """Wait for build to complete"""
+    print(f"\nWaiting for build to complete...")
+    start_time = time.time()
+    last_status = None
+    
+    while time.time() - start_time < max_wait:
+        try:
+            response = requests.get(
+                f"{api_url}/instances/{instance_id}/build-status",
+                verify=False
+            )
+            if response.status_code == 404:
+                # Build status not found, might be completed
+                return True
+            
+            data = response.json()
+            status = data.get("status", "unknown")
+            
+            if status != last_status:
+                print(f"\nBuild status: {status}")
+                last_status = status
+            else:
+                print(".", end="", flush=True)
+            
+            if status == "completed":
+                print("\nBuild completed successfully!")
+                return True
+            elif status == "failed":
+                print(f"\nBuild failed: {data.get('error', 'Unknown error')}")
+                return False
+            
+            time.sleep(5)
+        except Exception as e:
+            print(f"\nError checking build status: {e}")
+            time.sleep(5)
+    
+    print(f"\nBuild timeout after {max_wait} seconds")
+    return False
 
 def create_simple_instance(args):
     """Create a simple VS Code Server instance"""
@@ -186,6 +232,14 @@ def create_devcontainer_instance(args):
     if response.get('build_logs_url'):
         print(f"Build Logs: {response['build_logs_url']}")
     
+    # Wait for build unless --no-wait is specified
+    if not args.no_wait:
+        if wait_for_build(args.api_url, response['instance_id']):
+            # Get updated instance details
+            instance_response = get_instance(args)
+            print("\nInstance is ready!")
+            print(f"Access URL: {instance_response['url']}")
+    
     return response
 
 def create_workspace_instance(args):
@@ -250,6 +304,14 @@ def create_workspace_instance(args):
     if response.get('build_logs_url'):
         print(f"Build Logs: {response['build_logs_url']}")
     
+    # Wait for build unless --no-wait is specified
+    if not args.no_wait:
+        if wait_for_build(args.api_url, response['instance_id']):
+            # Get updated instance details
+            instance_response = get_instance(args)
+            print("\nInstance is ready!")
+            print(f"Access URL: {instance_response['url']}")
+    
     return response
 
 def get_instance(args):
@@ -285,6 +347,17 @@ def get_build_logs(args):
     
     return response
 
+def get_build_status(args):
+    """Get build status for an instance"""
+    response = make_api_request("GET", f"{args.api_url}/instances/{args.instance_id}/build-status")
+    
+    print(f"Build status for instance {args.instance_id}:")
+    print(f"Status: {response['status']}")
+    if response.get('error'):
+        print(f"Error: {response['error']}")
+    
+    return response
+
 def delete_instance(args):
     """Delete a VS Code Server instance"""
     response = make_api_request("DELETE", f"{args.api_url}/instances/{args.instance_id}")
@@ -307,6 +380,8 @@ def main():
         get_instance(args)
     elif args.command == "build-logs":
         get_build_logs(args)
+    elif args.command == "build-status":
+        get_build_status(args)
     elif args.command == "delete":
         delete_instance(args)
     else:

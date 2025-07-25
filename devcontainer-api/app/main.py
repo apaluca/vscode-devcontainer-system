@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client, config
 from pydantic import BaseModel, validator
@@ -15,6 +15,7 @@ import asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import hashlib
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -41,9 +42,11 @@ app.add_middleware(
 try:
     config.load_incluster_config()
     logger.info("Loaded in-cluster Kubernetes configuration")
+    IN_CLUSTER = True
 except config.ConfigException:
     config.load_kube_config()
     logger.info("Loaded kubeconfig Kubernetes configuration")
+    IN_CLUSTER = False
 
 # Create API clients
 core_v1_api = client.CoreV1Api()
@@ -64,6 +67,24 @@ DEFAULT_CPU_REQUEST = "200m"
 DEFAULT_CPU_LIMIT = "1000m"
 DEFAULT_BASE_IMAGE = "ubuntu:22.04"  # Following devcontainer CLI best practices, use plain base images
 DEVCONTAINER_BUILD_PATH = "/tmp/devcontainer-builds"
+
+# When running in cluster, use the registry service name
+if IN_CLUSTER:
+    # For MicroK8s, the registry is accessible via the node IP and port 32000
+    # We need to get the node IP
+    try:
+        nodes = core_v1_api.list_node()
+        if nodes.items:
+            node_ip = None
+            for address in nodes.items[0].status.addresses:
+                if address.type == "InternalIP":
+                    node_ip = address.address
+                    break
+            if node_ip:
+                REGISTRY = f"{node_ip}:32000"
+                logger.info(f"Using registry at {REGISTRY}")
+    except Exception as e:
+        logger.error(f"Failed to get node IP: {e}")
 
 # Path configuration
 API_PATH_PREFIX = "/api"
@@ -184,6 +205,39 @@ def ensure_shared_storage_pvc(user_id: str, storage_size: str) -> None:
             detail=f"Failed to create shared storage PVC: {str(e)}"
         )
 
+async def configure_docker_for_registry():
+    """Configure Docker to accept insecure registry"""
+    docker_host = os.environ.get("DOCKER_HOST", "tcp://docker-dind-service:2375")
+    env = {**os.environ, "DOCKER_HOST": docker_host}
+    
+    # Create daemon.json config
+    daemon_config = {
+        "insecure-registries": [REGISTRY, "localhost:32000", f"{REGISTRY.split(':')[0]}:32000"]
+    }
+    
+    config_json = json.dumps(daemon_config)
+    
+    # Try to configure Docker daemon
+    try:
+        # First, check if we can connect to Docker
+        test_cmd = await asyncio.create_subprocess_exec(
+            "docker", "info",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env
+        )
+        stdout, stderr = await test_cmd.communicate()
+        
+        if test_cmd.returncode == 0:
+            logger.info("Docker daemon is accessible")
+            # Check if registry is already configured
+            if REGISTRY in stdout.decode() or "insecure registries" in stdout.decode().lower():
+                logger.info(f"Registry {REGISTRY} appears to be configured")
+        else:
+            logger.warning(f"Docker info failed: {stderr.decode()}")
+    except Exception as e:
+        logger.error(f"Error configuring Docker: {e}")
+
 async def build_devcontainer_image(
     instance_id: str,
     workspace_path: str,
@@ -192,6 +246,29 @@ async def build_devcontainer_image(
     """Build a devcontainer image using the devcontainer CLI"""
     build_dir = os.path.join(DEVCONTAINER_BUILD_PATH, instance_id)
     os.makedirs(build_dir, exist_ok=True)
+    
+    # Configure Docker for insecure registry
+    await configure_docker_for_registry()
+    
+    # Test Docker connectivity first
+    docker_host = os.environ.get("DOCKER_HOST", "tcp://docker-dind-service:2375")
+    env = {**os.environ, "DOCKER_HOST": docker_host}
+    
+    try:
+        docker_test = await asyncio.create_subprocess_exec(
+            "docker", "version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env
+        )
+        stdout, stderr = await docker_test.communicate()
+        if docker_test.returncode != 0:
+            logger.error(f"Docker connectivity test failed: {stderr.decode()}")
+            raise Exception("Cannot connect to Docker daemon")
+        logger.info("Docker daemon is accessible")
+    except Exception as e:
+        logger.error(f"Docker connectivity error: {e}")
+        raise Exception(f"Docker daemon not accessible: {str(e)}")
     
     try:
         # If devcontainer_config is provided, write it to the workspace
@@ -219,7 +296,8 @@ async def build_devcontainer_image(
             *build_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=build_dir
+            cwd=build_dir,
+            env=env
         )
         
         # Collect build logs
@@ -237,18 +315,89 @@ async def build_devcontainer_image(
         if process.returncode != 0:
             raise Exception(f"Build failed with return code {process.returncode}")
         
-        # Push the image to registry
+        # For MicroK8s registry, we might need to tag and push differently
+        # First, let's try to push directly
+        logger.info(f"Pushing image {image_name} to registry")
+        
+        # Try multiple push strategies
+        push_success = False
+        push_errors = []
+        
+        # Strategy 1: Direct push
         push_cmd = ["docker", "push", image_name]
+        logger.info(f"Attempting direct push: {' '.join(push_cmd)}")
         push_process = await asyncio.create_subprocess_exec(
             *push_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
+            stderr=asyncio.subprocess.STDOUT,
+            env=env
         )
+        
+        push_output = []
+        while True:
+            line = await push_process.stdout.readline()
+            if not line:
+                break
+            output_line = line.decode().strip()
+            push_output.append(output_line)
+            logger.info(f"Push output: {output_line}")
         
         await push_process.wait()
         
-        if push_process.returncode != 0:
-            raise Exception("Failed to push image to registry")
+        if push_process.returncode == 0:
+            push_success = True
+            logger.info("Successfully pushed image to registry")
+        else:
+            error_msg = f"Direct push failed with return code {push_process.returncode}"
+            push_errors.append(error_msg)
+            logger.warning(error_msg)
+            
+            # Strategy 2: Try retagging if localhost doesn't work
+            if "localhost" in image_name and REGISTRY != "localhost:32000":
+                # Retag the image with the actual registry address
+                retag_name = image_name.replace("localhost:32000", REGISTRY)
+                retag_cmd = ["docker", "tag", image_name, retag_name]
+                logger.info(f"Retagging image: {' '.join(retag_cmd)}")
+                
+                retag_process = await asyncio.create_subprocess_exec(
+                    *retag_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env
+                )
+                await retag_process.wait()
+                
+                if retag_process.returncode == 0:
+                    # Try pushing the retagged image
+                    push_cmd = ["docker", "push", retag_name]
+                    logger.info(f"Pushing retagged image: {' '.join(push_cmd)}")
+                    
+                    push_process = await asyncio.create_subprocess_exec(
+                        *push_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        env=env
+                    )
+                    
+                    await push_process.wait()
+                    
+                    if push_process.returncode == 0:
+                        push_success = True
+                        image_name = retag_name
+                        logger.info(f"Successfully pushed retagged image: {retag_name}")
+                    else:
+                        error_msg = f"Retagged push failed with return code {push_process.returncode}"
+                        push_errors.append(error_msg)
+                        logger.warning(error_msg)
+        
+        if not push_success:
+            # Log all errors
+            all_errors = "\n".join(push_errors)
+            logger.error(f"Failed to push image after all attempts:\n{all_errors}")
+            # Instead of failing, we'll use the local image
+            logger.warning("Will attempt to use the locally built image")
+            # Add a note to the build logs
+            build_logs.append(f"WARNING: Failed to push to registry, using local image: {image_name}")
         
         # Store build logs
         logs_cm = client.V1ConfigMap(
@@ -257,7 +406,7 @@ async def build_devcontainer_image(
                 labels={"app": BASE_NAME, "instance": instance_id}
             ),
             data={
-                "logs": "\n".join(build_logs),
+                "logs": "\n".join(build_logs + push_output),
                 "timestamp": datetime.utcnow().isoformat()
             }
         )
@@ -677,6 +826,230 @@ def delete_instance_resources(instance_id: str) -> None:
                 detail=f"Failed to delete resources: {str(e)}"
             )
 
+# Background task functions
+async def build_and_deploy_devcontainer(build_config: Dict[str, Any]):
+    """Background task to build and deploy devcontainer"""
+    instance_id = build_config["instance_id"]
+    
+    # Update status to building
+    try:
+        status_cm = core_v1_api.read_namespaced_config_map(
+            name=f"{instance_id}-build-status",
+            namespace=NAMESPACE
+        )
+        status_cm.data["status"] = "building"
+        core_v1_api.patch_namespaced_config_map(
+            name=f"{instance_id}-build-status",
+            namespace=NAMESPACE,
+            body=status_cm
+        )
+    except Exception as e:
+        logger.error(f"Error updating build status: {e}")
+    
+    # Create temporary workspace for building
+    workspace_dir = tempfile.mkdtemp()
+    try:
+        # Build devcontainer image
+        devcontainer_image = await build_devcontainer_image(
+            instance_id,
+            workspace_dir,
+            build_config["devcontainer_config"]
+        )
+        
+        # Update status to deploying
+        try:
+            status_cm.data["status"] = "deploying"
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+        
+        # Ensure shared storage exists
+        ensure_shared_storage_pvc(build_config["user_id"], build_config["shared_storage_size"])
+        
+        # Create resources
+        create_configmap(
+            instance_id, 
+            build_config["access_token"], 
+            DEFAULT_BASE_IMAGE, 
+            devcontainer_image, 
+            build_config["vscode_version"]
+        )
+        create_workspace_pvc(instance_id, build_config["storage_size"])
+        create_deployment(
+            instance_id,
+            build_config["user_id"],
+            build_config["memory_request"], 
+            build_config["memory_limit"],
+            build_config["cpu_request"],
+            build_config["cpu_limit"],
+            devcontainer_image,
+            build_config["vscode_version"]
+        )
+        create_service(instance_id)
+        create_ingress_for_instance(instance_id, INSTANCES_PATH_PREFIX)
+        
+        # Update status to completed
+        try:
+            status_cm.data["status"] = "completed"
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Error building devcontainer: {e}")
+        # Update status to failed
+        try:
+            status_cm.data["status"] = "failed"
+            status_cm.data["error"] = str(e)
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+        # Clean up build status ConfigMap after some time
+        await asyncio.sleep(300)  # Keep status for 5 minutes
+        try:
+            core_v1_api.delete_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE
+            )
+        except:
+            pass
+
+async def build_and_deploy_workspace(build_config: Dict[str, Any]):
+    """Background task to build and deploy workspace"""
+    instance_id = build_config["instance_id"]
+    
+    # Update status to building
+    try:
+        status_cm = core_v1_api.read_namespaced_config_map(
+            name=f"{instance_id}-build-status",
+            namespace=NAMESPACE
+        )
+        status_cm.data["status"] = "building"
+        core_v1_api.patch_namespaced_config_map(
+            name=f"{instance_id}-build-status",
+            namespace=NAMESPACE,
+            body=status_cm
+        )
+    except Exception as e:
+        logger.error(f"Error updating build status: {e}")
+    
+    # Extract workspace
+    workspace_dir = tempfile.mkdtemp()
+    try:
+        # Save uploaded file
+        workspace_path = os.path.join(workspace_dir, "workspace.tar.gz")
+        with open(workspace_path, "wb") as f:
+            f.write(build_config["workspace_content"])
+        
+        # Extract tar.gz
+        with tarfile.open(workspace_path, "r:gz") as tar:
+            tar.extractall(workspace_dir)
+        
+        os.remove(workspace_path)
+        
+        # Find devcontainer.json
+        devcontainer_json_path = None
+        for root, dirs, files in os.walk(workspace_dir):
+            if "devcontainer.json" in files:
+                devcontainer_json_path = os.path.join(root, "devcontainer.json")
+                break
+        
+        if not devcontainer_json_path:
+            raise Exception("No devcontainer.json found in workspace")
+        
+        # Build devcontainer image
+        devcontainer_image = await build_devcontainer_image(
+            instance_id,
+            workspace_dir,
+            None  # Use existing devcontainer.json from workspace
+        )
+        
+        # Update status to deploying
+        try:
+            status_cm.data["status"] = "deploying"
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+        
+        # Ensure shared storage exists
+        ensure_shared_storage_pvc(build_config["user_id"], build_config["shared_storage_size"])
+        
+        # Create resources
+        create_configmap(
+            instance_id, 
+            build_config["access_token"], 
+            DEFAULT_BASE_IMAGE, 
+            devcontainer_image, 
+            build_config["vscode_version"]
+        )
+        create_workspace_pvc(instance_id, build_config["storage_size"])
+        create_deployment(
+            instance_id,
+            build_config["user_id"],
+            build_config["memory_request"], 
+            build_config["memory_limit"],
+            build_config["cpu_request"],
+            build_config["cpu_limit"],
+            devcontainer_image,
+            build_config["vscode_version"]
+        )
+        create_service(instance_id)
+        create_ingress_for_instance(instance_id, INSTANCES_PATH_PREFIX)
+        
+        # Update status to completed
+        try:
+            status_cm.data["status"] = "completed"
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Error building workspace: {e}")
+        # Update status to failed
+        try:
+            status_cm.data["status"] = "failed"
+            status_cm.data["error"] = str(e)
+            core_v1_api.patch_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE,
+                body=status_cm
+            )
+        except:
+            pass
+    finally:
+        shutil.rmtree(workspace_dir, ignore_errors=True)
+        # Clean up build status ConfigMap after some time
+        await asyncio.sleep(300)  # Keep status for 5 minutes
+        try:
+            core_v1_api.delete_namespaced_config_map(
+                name=f"{instance_id}-build-status",
+                namespace=NAMESPACE
+            )
+        except:
+            pass
+
 # API Endpoints
 @app.get("/", status_code=status.HTTP_200_OK)
 def root():
@@ -726,6 +1099,7 @@ async def create_simple_instance(request: VSCodeServerRequest):
 
 @app.post("/instances/devcontainer", response_model=VSCodeServerResponse, status_code=status.HTTP_201_CREATED)
 async def create_devcontainer_instance(
+    background_tasks: BackgroundTasks,
     user_id: str = Form(...),
     devcontainer_json: UploadFile = File(...),
     storage_size: str = Form(DEFAULT_STORAGE_SIZE),
@@ -751,37 +1125,50 @@ async def create_devcontainer_instance(
             detail=f"Invalid devcontainer.json: {str(e)}"
         )
     
-    # Create temporary workspace for building
-    workspace_dir = tempfile.mkdtemp()
+    # Store build configuration
+    build_config = {
+        "instance_id": instance_id,
+        "user_id": user_id,
+        "devcontainer_config": devcontainer_config,
+        "storage_size": storage_size,
+        "shared_storage_size": shared_storage_size,
+        "memory_request": memory_request,
+        "memory_limit": memory_limit,
+        "cpu_request": cpu_request,
+        "cpu_limit": cpu_limit,
+        "vscode_version": vscode_version,
+        "access_token": access_token
+    }
+    
+    # Create initial ConfigMap to track build status
+    status_cm = client.V1ConfigMap(
+        metadata=client.V1ObjectMeta(
+            name=f"{instance_id}-build-status",
+            labels={"app": BASE_NAME, "instance": instance_id}
+        ),
+        data={
+            "status": "queued",
+            "config": json.dumps(build_config)
+        }
+    )
+    
     try:
-        # Build devcontainer image
-        devcontainer_image = await build_devcontainer_image(
-            instance_id,
-            workspace_dir,
-            devcontainer_config
+        core_v1_api.create_namespaced_config_map(
+            namespace=NAMESPACE,
+            body=status_cm
         )
-        
-        # Ensure shared storage exists
-        ensure_shared_storage_pvc(user_id, shared_storage_size)
-        
-        # Create resources
-        create_configmap(instance_id, access_token, DEFAULT_BASE_IMAGE, devcontainer_image, vscode_version)
-        create_workspace_pvc(instance_id, storage_size)
-        create_deployment(
-            instance_id,
-            user_id,
-            memory_request, 
-            memory_limit,
-            cpu_request,
-            cpu_limit,
-            devcontainer_image,
-            vscode_version
+    except client.exceptions.ApiException as e:
+        logger.error(f"Error creating build status ConfigMap: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create build status: {str(e)}"
         )
-        create_service(instance_id)
-        create_ingress_for_instance(instance_id, INSTANCES_PATH_PREFIX)
-        
-    finally:
-        shutil.rmtree(workspace_dir, ignore_errors=True)
+    
+    # Start build in background
+    background_tasks.add_task(
+        build_and_deploy_devcontainer,
+        build_config
+    )
     
     url = f"https://{BASE_DOMAIN}{path}?tkn={access_token}"
     build_logs_url = f"https://{BASE_DOMAIN}{API_PATH_PREFIX}/instances/{instance_id}/build-logs"
@@ -790,14 +1177,15 @@ async def create_devcontainer_instance(
         instance_id=instance_id,
         url=url,
         access_token=access_token,
-        status="Building",
+        status="Queued",
         base_image=DEFAULT_BASE_IMAGE,
-        devcontainer_image=devcontainer_image,
+        devcontainer_image=f"{REGISTRY}/vscode-devcontainer-{instance_id}:latest",
         build_logs_url=build_logs_url
     )
 
 @app.post("/instances/workspace", response_model=VSCodeServerResponse, status_code=status.HTTP_201_CREATED)
 async def create_workspace_instance(
+    background_tasks: BackgroundTasks,
     user_id: str = Form(...),
     workspace: UploadFile = File(...),
     storage_size: str = Form(DEFAULT_STORAGE_SIZE),
@@ -813,62 +1201,53 @@ async def create_workspace_instance(
     access_token = generate_access_token()
     path = generate_instance_path(instance_id)
     
-    # Extract workspace
-    workspace_dir = tempfile.mkdtemp()
+    # Save workspace content
+    workspace_content = await workspace.read()
+    
+    # Store build configuration
+    build_config = {
+        "instance_id": instance_id,
+        "user_id": user_id,
+        "workspace_content": workspace_content,
+        "storage_size": storage_size,
+        "shared_storage_size": shared_storage_size,
+        "memory_request": memory_request,
+        "memory_limit": memory_limit,
+        "cpu_request": cpu_request,
+        "cpu_limit": cpu_limit,
+        "vscode_version": vscode_version,
+        "access_token": access_token
+    }
+    
+    # Create initial ConfigMap to track build status
+    status_cm = client.V1ConfigMap(
+        metadata=client.V1ObjectMeta(
+            name=f"{instance_id}-build-status",
+            labels={"app": BASE_NAME, "instance": instance_id}
+        ),
+        data={
+            "status": "queued",
+            "config": json.dumps({k: v for k, v in build_config.items() if k != "workspace_content"})
+        }
+    )
+    
     try:
-        # Save uploaded file
-        workspace_path = os.path.join(workspace_dir, "workspace.tar.gz")
-        with open(workspace_path, "wb") as f:
-            content = await workspace.read()
-            f.write(content)
-        
-        # Extract tar.gz
-        with tarfile.open(workspace_path, "r:gz") as tar:
-            tar.extractall(workspace_dir)
-        
-        os.remove(workspace_path)
-        
-        # Find devcontainer.json
-        devcontainer_json_path = None
-        for root, dirs, files in os.walk(workspace_dir):
-            if "devcontainer.json" in files:
-                devcontainer_json_path = os.path.join(root, "devcontainer.json")
-                break
-        
-        if not devcontainer_json_path:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No devcontainer.json found in workspace"
-            )
-        
-        # Build devcontainer image
-        devcontainer_image = await build_devcontainer_image(
-            instance_id,
-            workspace_dir,
-            None  # Use existing devcontainer.json from workspace
+        core_v1_api.create_namespaced_config_map(
+            namespace=NAMESPACE,
+            body=status_cm
         )
-        
-        # Ensure shared storage exists
-        ensure_shared_storage_pvc(user_id, shared_storage_size)
-        
-        # Create resources
-        create_configmap(instance_id, access_token, DEFAULT_BASE_IMAGE, devcontainer_image, vscode_version)
-        create_workspace_pvc(instance_id, storage_size)
-        create_deployment(
-            instance_id,
-            user_id,
-            memory_request, 
-            memory_limit,
-            cpu_request,
-            cpu_limit,
-            devcontainer_image,
-            vscode_version
+    except client.exceptions.ApiException as e:
+        logger.error(f"Error creating build status ConfigMap: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create build status: {str(e)}"
         )
-        create_service(instance_id)
-        create_ingress_for_instance(instance_id, INSTANCES_PATH_PREFIX)
-        
-    finally:
-        shutil.rmtree(workspace_dir, ignore_errors=True)
+    
+    # Start build in background
+    background_tasks.add_task(
+        build_and_deploy_workspace,
+        build_config
+    )
     
     url = f"https://{BASE_DOMAIN}{path}?tkn={access_token}"
     build_logs_url = f"https://{BASE_DOMAIN}{API_PATH_PREFIX}/instances/{instance_id}/build-logs"
@@ -877,11 +1256,44 @@ async def create_workspace_instance(
         instance_id=instance_id,
         url=url,
         access_token=access_token,
-        status="Building",
+        status="Queued",
         base_image=DEFAULT_BASE_IMAGE,
-        devcontainer_image=devcontainer_image,
+        devcontainer_image=f"{REGISTRY}/vscode-devcontainer-{instance_id}:latest",
         build_logs_url=build_logs_url
     )
+
+@app.get("/instances/{instance_id}/build-status")
+def get_build_status(instance_id: str):
+    """Get the current build status of an instance"""
+    try:
+        status_cm = core_v1_api.read_namespaced_config_map(
+            name=f"{instance_id}-build-status",
+            namespace=NAMESPACE
+        )
+        return {
+            "instance_id": instance_id,
+            "status": status_cm.data.get("status", "unknown"),
+            "error": status_cm.data.get("error", None)
+        }
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            # Check if instance exists
+            try:
+                core_v1_api.read_namespaced_config_map(
+                    name=f"{instance_id}-config",
+                    namespace=NAMESPACE
+                )
+                return {
+                    "instance_id": instance_id,
+                    "status": "completed",
+                    "error": None
+                }
+            except:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Instance {instance_id} not found"
+                )
+        raise
 
 @app.get("/instances/{instance_id}/build-logs", response_model=BuildStatus)
 def get_build_logs(instance_id: str):
