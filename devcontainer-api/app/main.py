@@ -514,50 +514,124 @@ def create_deployment(
     container_image = devcontainer_image or DEFAULT_BASE_IMAGE
     
     # VS Code installation script
-    install_script = f"""
-    # Ensure user exists
-    if ! id vscode >/dev/null 2>&1; then
-        useradd -m -s /bin/bash -u 1000 vscode
+    install_script = f'''#!/bin/bash
+set -e
+
+echo "=== VS Code Server Setup ==="
+echo "Starting installation process..."
+echo "Architecture: $(uname -m)"
+echo "Home directory: $HOME"
+
+# Ensure user exists and create if not
+if ! id vscode >/dev/null 2>&1; then
+    echo "Creating vscode user..."
+    useradd -m -s /bin/bash -u 1000 vscode 2>/dev/null || true
+fi
+
+# Install basic dependencies if not available
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y curl wget ca-certificates git sudo jq unzip file tar gzip >/dev/null 2>&1 || true
+fi
+
+# Define locations
+INSTALL_LOCATION="/home/vscode/.local/bin"
+DATA_DIR="/home/vscode/.vscode-server"
+VSCODE_VERSION="{vscode_version}"
+
+# Create directories with proper ownership
+mkdir -p "$INSTALL_LOCATION"
+mkdir -p "$DATA_DIR/data/Machine"
+mkdir -p "$DATA_DIR/extensions"
+mkdir -p /home/vscode/.vscode/cli-data
+mkdir -p /home/vscode/.vscode/user-data
+mkdir -p /home/vscode/.vscode/server-data
+mkdir -p /home/vscode/.vscode/extensions
+
+# Check if VS Code CLI is already installed
+if [ ! -e "$INSTALL_LOCATION/code" ]; then
+    echo "Installing VS Code CLI..."
+    
+    # Determine architecture
+    if [ "$(uname -m)" = "x86_64" ]; then
+        TARGET="cli-linux-x64"
+    elif [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+        TARGET="cli-linux-arm64"
+    else
+        echo "ERROR: Unsupported architecture: $(uname -m)"
+        exit 1
     fi
     
-    # Install dependencies if not in devcontainer image
-    if ! command -v code >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update && apt-get install -y curl wget ca-certificates git sudo
-        fi
-        
-        # Determine architecture
-        if [ "$(uname -m)" = "x86_64" ]; then
-            export TARGET='cli-linux-x64'
-        elif [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
-            export TARGET='cli-linux-arm64'
-        else
-            echo "Unsupported architecture: $(uname -m)"
-            exit 1
-        fi
-        
-        # Install VS Code CLI
-        wget -qO- "https://update.code.visualstudio.com/{vscode_version}/${{TARGET}}/stable" | tar xvz -C /usr/bin/
-        chmod +x /usr/bin/code
+    echo "Selected target: $TARGET"
+    DOWNLOAD_URL="https://update.code.visualstudio.com/${{VSCODE_VERSION}}/${{TARGET}}/stable"
+    echo "Download URL: $DOWNLOAD_URL"
+    
+    # Download and install VS Code CLI
+    echo "Downloading VS Code CLI..."
+    if type curl > /dev/null 2>&1; then
+        curl -L "$DOWNLOAD_URL" | tar xz -C "$INSTALL_LOCATION"
+    elif type wget > /dev/null 2>&1; then
+        wget -qO- "$DOWNLOAD_URL" | tar xz -C "$INSTALL_LOCATION"
+    else
+        echo "ERROR: Installation failed. Please install curl or wget in your container image."
+        exit 1
     fi
     
-    # Set up directories
-    mkdir -p /home/vscode/.vscode/cli-data /home/vscode/.vscode/user-data /home/vscode/.vscode/server-data /home/vscode/.vscode/extensions
-    chown -R vscode:vscode /home/vscode /workspace /shared
+    chmod +x "$INSTALL_LOCATION/code"
+    echo "VS Code CLI installed successfully at: $INSTALL_LOCATION/code"
+else
+    echo "VS Code CLI already installed at: $INSTALL_LOCATION/code"
+fi
+
+# Set proper ownership
+chown -R vscode:vscode /home/vscode /workspace /shared
+
+# Add to PATH
+export PATH="$INSTALL_LOCATION:$PATH"
+
+# Test the VS Code CLI
+echo "Testing VS Code CLI..."
+if "$INSTALL_LOCATION/code" --version; then
+    echo "VS Code CLI is working correctly."
+else
+    echo "ERROR: VS Code CLI test failed."
+    exit 1
+fi
+
+# Export environment variables for vscode user
+export TOKEN="${{TOKEN}}"
+export CLI_DATA_DIR="${{CLI_DATA_DIR}}"
+export USER_DATA_DIR="${{USER_DATA_DIR}}"
+export SERVER_DATA_DIR="${{SERVER_DATA_DIR}}"
+export EXTENSIONS_DIR="${{EXTENSIONS_DIR}}"
+
+echo "Starting VS Code Server..."
+echo "Server will be available at: http://localhost:8000"
+echo "Instance path: {instance_path}"
+echo "Token: ${{TOKEN}}"
+
+# Start VS Code Server as vscode user with the correct parameters
+exec su - vscode -c "
+    export PATH='$INSTALL_LOCATION:$PATH'
+    export TOKEN='${{TOKEN}}'
+    export CLI_DATA_DIR='${{CLI_DATA_DIR}}'
+    export USER_DATA_DIR='${{USER_DATA_DIR}}'
+    export SERVER_DATA_DIR='${{SERVER_DATA_DIR}}'
+    export EXTENSIONS_DIR='${{EXTENSIONS_DIR}}'
     
-    # Export environment variables for vscode user
-    export TOKEN="${{TOKEN}}"
-    export CLI_DATA_DIR="${{CLI_DATA_DIR}}"
-    export USER_DATA_DIR="${{USER_DATA_DIR}}"
-    export SERVER_DATA_DIR="${{SERVER_DATA_DIR}}"
-    export EXTENSIONS_DIR="${{EXTENSIONS_DIR}}"
-    
-    # Run VS Code Server as vscode user
-    exec su - vscode -c "code serve-web --accept-server-license-terms --host 0.0.0.0 --port 8000 \\
-        --connection-token '${{TOKEN}}' --server-base-path '{instance_path}' \\
-        --cli-data-dir '${{CLI_DATA_DIR}}' --user-data-dir '${{USER_DATA_DIR}}' \\
-        --server-data-dir '${{SERVER_DATA_DIR}}' --extensions-dir '${{EXTENSIONS_DIR}}'"
-    """
+    echo 'Starting VS Code Server as vscode user...'
+    exec '$INSTALL_LOCATION/code' serve-web \\
+        --accept-server-license-terms \\
+        --host 0.0.0.0 \\
+        --port 8000 \\
+        --connection-token '${{TOKEN}}' \\
+        --server-base-path '{instance_path}' \\
+        --cli-data-dir '${{CLI_DATA_DIR}}' \\
+        --user-data-dir '${{USER_DATA_DIR}}' \\
+        --server-data-dir '${{SERVER_DATA_DIR}}' \\
+        --extensions-dir '${{EXTENSIONS_DIR}}'
+"
+'''
     
     deployment = client.V1Deployment(
         metadata=client.V1ObjectMeta(
