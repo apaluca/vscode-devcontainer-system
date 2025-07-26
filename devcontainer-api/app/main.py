@@ -742,49 +742,6 @@ export USER_DATA_DIR="${{USER_DATA_DIR}}"
 export SERVER_DATA_DIR="${{SERVER_DATA_DIR}}"
 export EXTENSIONS_DIR="${{EXTENSIONS_DIR}}"
 
-echo ""
-echo "Initializing workspace..."
-# Initialize workspace with a welcome file if empty
-if [ -z "$(ls -A /workspace 2>/dev/null)" ]; then
-    echo "Creating welcome file in empty workspace..."
-    su - vscode -c "
-        cat > /workspace/README.md << 'EOF'
-# Welcome to VS Code DevContainer!
-
-Your development environment is ready.
-
-## Environment Details
-- Instance ID: {instance_path}
-- Base Image: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')
-- VS Code Version: {vscode_version}
-
-## Installed Extensions
-$(if [ -d "$DATA_DIR/extensions" ]; then
-    for ext in "$DATA_DIR/extensions"/*; do
-        if [ -d "$ext" ] && [ -f "$ext/package.json" ]; then
-            name=$(jq -r '.displayName // .name' "$ext/package.json" 2>/dev/null)
-            version=$(jq -r '.version' "$ext/package.json" 2>/dev/null)
-            echo "- $name (v$version)"
-        fi
-    done
-else
-    echo "None"
-fi)
-
-## Quick Start
-1. Open the file explorer on the left
-2. Create new files and folders
-3. Start coding!
-
-## Storage
-- **/workspace**: Your project files (instance-specific)
-- **/shared**: Shared storage across all your instances
-EOF
-    " || echo "Failed to create welcome file"
-else
-    echo "Workspace already contains files."
-fi
-
 # List installed extensions
 echo ""
 echo "Installed extensions:"
