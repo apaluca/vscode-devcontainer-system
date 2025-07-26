@@ -433,8 +433,33 @@ async def build_devcontainer_image(
             shutil.rmtree(build_dir)
 
 def create_configmap(instance_id: str, access_token: str, base_image: str, 
-                    devcontainer_image: Optional[str], vscode_version: str) -> None:
+                    devcontainer_image: Optional[str], vscode_version: str,
+                    devcontainer_config: Optional[Dict[str, Any]] = None) -> None:
     """Create a ConfigMap for the VS Code Server instance"""
+    
+    # Prepare devcontainer configuration for VS Code
+    vscode_config = {
+        "extensions": [],
+        "settings": {}
+    }
+    
+    if devcontainer_config:
+        # Extract VS Code specific configuration
+        customizations = devcontainer_config.get("customizations", {})
+        vscode_customizations = customizations.get("vscode", {})
+        
+        # Get extensions
+        extensions = vscode_customizations.get("extensions", [])
+        vscode_config["extensions"] = extensions
+        
+        # Get settings
+        settings = vscode_customizations.get("settings", {})
+        vscode_config["settings"] = settings
+        
+        # Also include postCreateCommand if present
+        if "postCreateCommand" in devcontainer_config:
+            vscode_config["postCreateCommand"] = devcontainer_config["postCreateCommand"]
+    
     configmap = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(
             name=f"{instance_id}-config",
@@ -450,7 +475,8 @@ def create_configmap(instance_id: str, access_token: str, base_image: str,
             "EXTENSIONS_DIR": "/home/vscode/.vscode/extensions",
             "BASE_IMAGE": base_image,
             "DEVCONTAINER_IMAGE": devcontainer_image or "",
-            "VSCODE_VERSION": vscode_version
+            "VSCODE_VERSION": vscode_version,
+            "VSCODE_CONFIG": json.dumps(vscode_config)  # Add VS Code configuration
         }
     )
     
@@ -513,7 +539,7 @@ def create_deployment(
     # Use devcontainer image if available, otherwise use base Ubuntu
     container_image = devcontainer_image or DEFAULT_BASE_IMAGE
     
-    # VS Code installation script
+    # VS Code installation script with extension support
     install_script = f'''#!/bin/bash
 set -e
 
@@ -598,6 +624,117 @@ else
     exit 1
 fi
 
+# Function to download and install extension from marketplace
+install_extension_from_marketplace() {{
+    local extension=$1
+    local publisher=$(echo "$extension" | cut -d. -f1)
+    local name=$(echo "$extension" | cut -d. -f2)
+    
+    echo "Installing extension: $extension"
+    
+    # Create temp directory for download
+    local temp_dir=$(mktemp -d)
+    local vsix_file="$temp_dir/${{extension}}.vsix"
+    
+    # Use the gallery.vsassets.io URL (most reliable)
+    local market_url="https://${{publisher}}.gallery.vsassets.io/_apis/public/gallery/publisher/${{publisher}}/extension/${{name}}/latest/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
+    
+    echo "  Downloading from: $market_url"
+    
+    # Download with curl, handling both gzipped and non-gzipped responses
+    if curl -L -f -H "Accept-Encoding: gzip" -o "$vsix_file" "$market_url" 2>/dev/null; then
+        echo "  Download completed"
+        
+        # Check if it's gzipped
+        if file "$vsix_file" | grep -q "gzip compressed data"; then
+            echo "  File is gzipped, decompressing..."
+            mv "$vsix_file" "$vsix_file.gz"
+            gunzip "$vsix_file.gz" || true
+        fi
+        
+        # Check if it's a valid VSIX (ZIP) file
+        if file "$vsix_file" | grep -q -E "(Zip archive data|ZIP archive data|Java archive data)"; then
+            # Extract VSIX to extensions directory
+            local ext_dir="$DATA_DIR/extensions/${{publisher}}.${{name}}"
+            rm -rf "$ext_dir"  # Remove if exists
+            mkdir -p "$ext_dir"
+            
+            echo "  Extracting to: $ext_dir"
+            if unzip -q -o "$vsix_file" -d "$ext_dir" 2>/dev/null; then
+                # Look for package.json in different locations
+                if [ -f "$ext_dir/extension/package.json" ]; then
+                    # Move contents of extension folder up one level
+                    mv "$ext_dir/extension/"* "$ext_dir/" 2>/dev/null || true
+                    rmdir "$ext_dir/extension" 2>/dev/null || true
+                fi
+                
+                if [ -f "$ext_dir/package.json" ]; then
+                    local ext_version=$(jq -r '.version // "unknown"' "$ext_dir/package.json" 2>/dev/null)
+                    echo "  ✓ Successfully installed version $ext_version"
+                else
+                    echo "  ✗ No package.json found in extension"
+                fi
+                
+                # Set proper ownership
+                chown -R vscode:vscode "$ext_dir"
+            else
+                echo "  ✗ Failed to extract VSIX"
+            fi
+        else
+            echo "  ✗ Downloaded file is not a valid VSIX/ZIP file"
+        fi
+    else
+        echo "  ✗ Failed to download extension"
+    fi
+    
+    # Clean up
+    rm -rf "$temp_dir"
+}}
+
+# Process VS Code configuration (extensions and settings)
+echo "Processing VS Code configuration..."
+if [ -n "${{VSCODE_CONFIG}}" ]; then
+    echo "${{VSCODE_CONFIG}}" > /tmp/vscode_config.json
+    
+    # Install extensions
+    extensions=$(jq -r '.extensions[]?' /tmp/vscode_config.json 2>/dev/null || echo "")
+    if [ -n "$extensions" ]; then
+        echo "Found extensions to install:"
+        echo "$extensions" | while read -r extension; do
+            echo "  - $extension"
+        done
+        echo ""
+        
+        # Install each extension
+        echo "$extensions" | while read -r extension; do
+            if [ -n "$extension" ]; then
+                install_extension_from_marketplace "$extension"
+            fi
+        done
+    else
+        echo "No extensions to install."
+    fi
+    
+    # Apply settings
+    settings=$(jq -c '.settings' /tmp/vscode_config.json 2>/dev/null || echo "{{}}")
+    if [ "$settings" != "{{}}" ] && [ "$settings" != "null" ]; then
+        echo "Applying VS Code settings..."
+        mkdir -p "$DATA_DIR/data/Machine"
+        echo "$settings" > "$DATA_DIR/data/Machine/settings.json"
+        chown -R vscode:vscode "$DATA_DIR/data"
+        echo "Settings applied."
+    fi
+    
+    # Run post-create command if present
+    postCreateCommand=$(jq -r '.postCreateCommand // ""' /tmp/vscode_config.json 2>/dev/null)
+    if [ -n "$postCreateCommand" ] && [ "$postCreateCommand" != "null" ] && [ "$postCreateCommand" != "" ]; then
+        echo "Running post-create command: $postCreateCommand"
+        su - vscode -c "cd /workspace && $postCreateCommand" || echo "Post-create command failed"
+    fi
+    
+    rm -f /tmp/vscode_config.json
+fi
+
 # Export environment variables for vscode user
 export TOKEN="${{TOKEN}}"
 export CLI_DATA_DIR="${{CLI_DATA_DIR}}"
@@ -605,6 +742,69 @@ export USER_DATA_DIR="${{USER_DATA_DIR}}"
 export SERVER_DATA_DIR="${{SERVER_DATA_DIR}}"
 export EXTENSIONS_DIR="${{EXTENSIONS_DIR}}"
 
+echo ""
+echo "Initializing workspace..."
+# Initialize workspace with a welcome file if empty
+if [ -z "$(ls -A /workspace 2>/dev/null)" ]; then
+    echo "Creating welcome file in empty workspace..."
+    su - vscode -c "
+        cat > /workspace/README.md << 'EOF'
+# Welcome to VS Code DevContainer!
+
+Your development environment is ready.
+
+## Environment Details
+- Instance ID: {instance_path}
+- Base Image: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')
+- VS Code Version: {vscode_version}
+
+## Installed Extensions
+$(if [ -d "$DATA_DIR/extensions" ]; then
+    for ext in "$DATA_DIR/extensions"/*; do
+        if [ -d "$ext" ] && [ -f "$ext/package.json" ]; then
+            name=$(jq -r '.displayName // .name' "$ext/package.json" 2>/dev/null)
+            version=$(jq -r '.version' "$ext/package.json" 2>/dev/null)
+            echo "- $name (v$version)"
+        fi
+    done
+else
+    echo "None"
+fi)
+
+## Quick Start
+1. Open the file explorer on the left
+2. Create new files and folders
+3. Start coding!
+
+## Storage
+- **/workspace**: Your project files (instance-specific)
+- **/shared**: Shared storage across all your instances
+EOF
+    " || echo "Failed to create welcome file"
+else
+    echo "Workspace already contains files."
+fi
+
+# List installed extensions
+echo ""
+echo "Installed extensions:"
+if [ -d "$DATA_DIR/extensions" ]; then
+    extension_count=0
+    for ext_dir in "$DATA_DIR/extensions"/*; do
+        if [ -d "$ext_dir" ] && [ -f "$ext_dir/package.json" ]; then
+            ext_name=$(basename "$ext_dir")
+            ext_display_name=$(jq -r '.displayName // .name // "Unknown"' "$ext_dir/package.json" 2>/dev/null)
+            ext_version=$(jq -r '.version // "unknown"' "$ext_dir/package.json" 2>/dev/null)
+            echo "  - $ext_name ($ext_display_name) v$ext_version"
+            extension_count=$((extension_count + 1))
+        fi
+    done
+    echo "Total: $extension_count extensions"
+else
+    echo "  None"
+fi
+
+echo ""
 echo "Starting VS Code Server..."
 echo "Server will be available at: http://localhost:8000"
 echo "Instance path: {instance_path}"
@@ -617,7 +817,7 @@ exec su - vscode -c "
     export CLI_DATA_DIR='${{CLI_DATA_DIR}}'
     export USER_DATA_DIR='${{USER_DATA_DIR}}'
     export SERVER_DATA_DIR='${{SERVER_DATA_DIR}}'
-    export EXTENSIONS_DIR='${{EXTENSIONS_DIR}}'
+    export EXTENSIONS_DIR='$DATA_DIR/extensions'
     
     echo 'Starting VS Code Server as vscode user...'
     exec '$INSTALL_LOCATION/code' serve-web \\
@@ -629,7 +829,7 @@ exec su - vscode -c "
         --cli-data-dir '${{CLI_DATA_DIR}}' \\
         --user-data-dir '${{USER_DATA_DIR}}' \\
         --server-data-dir '${{SERVER_DATA_DIR}}' \\
-        --extensions-dir '${{EXTENSIONS_DIR}}'
+        --extensions-dir '$DATA_DIR/extensions'
 "
 '''
     
@@ -950,13 +1150,14 @@ async def build_and_deploy_devcontainer(build_config: Dict[str, Any]):
         # Ensure shared storage exists
         ensure_shared_storage_pvc(build_config["user_id"], build_config["shared_storage_size"])
         
-        # Create resources
+        # Create resources with devcontainer config
         create_configmap(
             instance_id, 
             build_config["access_token"], 
             DEFAULT_BASE_IMAGE, 
             devcontainer_image, 
-            build_config["vscode_version"]
+            build_config["vscode_version"],
+            build_config["devcontainer_config"]  # Pass the devcontainer config
         )
         create_workspace_pvc(instance_id, build_config["storage_size"])
         create_deployment(
@@ -1029,6 +1230,7 @@ async def build_and_deploy_workspace(build_config: Dict[str, Any]):
     
     # Extract workspace
     workspace_dir = tempfile.mkdtemp()
+    devcontainer_config = None
     try:
         # Save uploaded file
         workspace_path = os.path.join(workspace_dir, "workspace.tar.gz")
@@ -1041,7 +1243,7 @@ async def build_and_deploy_workspace(build_config: Dict[str, Any]):
         
         os.remove(workspace_path)
         
-        # Find devcontainer.json
+        # Find and read devcontainer.json
         devcontainer_json_path = None
         for root, dirs, files in os.walk(workspace_dir):
             if "devcontainer.json" in files:
@@ -1050,6 +1252,10 @@ async def build_and_deploy_workspace(build_config: Dict[str, Any]):
         
         if not devcontainer_json_path:
             raise Exception("No devcontainer.json found in workspace")
+        
+        # Read devcontainer configuration
+        with open(devcontainer_json_path, 'r') as f:
+            devcontainer_config = json.load(f)
         
         # Build devcontainer image
         devcontainer_image = await build_devcontainer_image(
@@ -1072,13 +1278,14 @@ async def build_and_deploy_workspace(build_config: Dict[str, Any]):
         # Ensure shared storage exists
         ensure_shared_storage_pvc(build_config["user_id"], build_config["shared_storage_size"])
         
-        # Create resources
+        # Create resources with devcontainer config
         create_configmap(
             instance_id, 
             build_config["access_token"], 
             DEFAULT_BASE_IMAGE, 
             devcontainer_image, 
-            build_config["vscode_version"]
+            build_config["vscode_version"],
+            devcontainer_config  # Pass the extracted devcontainer config
         )
         create_workspace_pvc(instance_id, build_config["storage_size"])
         create_deployment(
@@ -1150,8 +1357,8 @@ async def create_simple_instance(request: VSCodeServerRequest):
     # Ensure shared storage exists
     ensure_shared_storage_pvc(request.user_id, request.shared_storage_size)
     
-    # Create resources
-    create_configmap(instance_id, access_token, request.base_image, None, request.vscode_version)
+    # Create resources - no devcontainer config for simple instances
+    create_configmap(instance_id, access_token, request.base_image, None, request.vscode_version, None)
     create_workspace_pvc(instance_id, request.storage_size)
     create_deployment(
         instance_id,
